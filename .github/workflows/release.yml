@@ -7,106 +7,115 @@ on:
       - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
 
 jobs:
-  create-release:
+  build-and-test:
+    strategy:
+      matrix:
+        ARCH: [x86_64, i386]
+        BUILD_TYPE: [appimage, coverage]
+      fail-fast: false
+
+    name: ${{ matrix.BUILD_TYPE }} ${{ matrix.ARCH }}
     runs-on: ubuntu-latest
-    outputs:
-      RELEASE_UPLOAD_ID: ${{ steps.create_release.outputs.id }}
+
+    env:
+      ARCH: ${{ matrix.ARCH }}
+      BUILD_TYPE: ${{ matrix.BUILD_TYPE }}
 
     steps:
       - uses: actions/checkout@v2
-      - name: Query version number
-        id: get_version
-        shell: bash
-        run: |
-          echo "using version tag ${GITHUB_REF:10}"
-          echo ::set-output name=version::"${GITHUB_REF:10}"
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: '${{ steps.get_version.outputs.VERSION }}'
-          release_name: 'OhMyBox ${{ steps.get_version.outputs.VERSION }}'
-          body: 'See the assets to download this version and install.'
+          submodules: recursive
 
-  build-tauri:
-    needs: create-release
+      - name: Install dependencies (x86_64)
+        if: matrix.ARCH == 'x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcovr libmagic-dev libjpeg-dev libpng-dev libboost-filesystem-dev libboost-regex-dev cimg-dev
+
+      - name: Install dependencies (i386)
+        if: matrix.ARCH == 'i386'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcovr libmagic-dev:i386 libjpeg-dev:i386 libpng-dev:i386 libboost-filesystem-dev:i386 libboost-regex-dev:i386 cimg-dev gcc-multilib g++-multilib libfuse2:i386
+
+      - name: Test coverage
+        run: bash -ex ci/test-coverage.sh
+        if: matrix.BUILD_TYPE == 'coverage'
+
+      - name: Build, test and build AppImage
+        run: bash -ex ci/build.sh
+        if: matrix.BUILD_TYPE != 'coverage'
+
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v2
+        if: matrix.BUILD_TYPE != 'coverage'
+        with:
+          name: AppImage
+          path: linuxdeploy*.AppImage*
+
+  container_build:
+    # The host should always be linux
+    runs-on: ubuntu-latest
+    name: ${{ matrix.BUILD_TYPE }} ${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest, ubuntu-latest, windows-latest]
-
-    runs-on: ${{ matrix.platform }}
+        BUILD_TYPE: [appimage, coverage]
+        distro:
+         - bullseye
+        arch:
+          - aarch64
+          - armv7
+          - armv6
+          - ppc64le
+          - s390x
     steps:
-      - uses: actions/checkout@v2
-
-      - name: Setup node
-        uses: actions/setup-node@v1
+      - uses: actions/checkout@v2.1.0
         with:
-          node-version: 16
-
-      - name: Install Rust stable
-        uses: actions-rs/toolchain@v1
+          submodules: recursive
+      - uses: uraimo/run-on-arch-action@v2.1.1
+        name: Build
+        id: build
         with:
-          toolchain: stable
+          arch: ${{ matrix.arch }}
+          distro: ${{ matrix.distro }}
+          githubToken: ${{ github.token }}
+          setup: mkdir -p "${PWD}/artifacts"
+          dockerRunArgs: --volume "${PWD}/artifacts:/artifacts"
+          shell: /bin/sh
+          install: |
+            apt-get update -y
+            apt-get install -y gcovr libmagic-dev libjpeg-dev libpng-dev libboost-filesystem-dev libboost-regex-dev cimg-dev cmake build-essential git wget libboost-dev patchelf autoconf libc-bin
 
-      # Rust cache
-      - uses: Swatinem/rust-cache@v1
+          run: |
+            if [ ${{matrix.BUILD_TYPE}} == 'coverage' ]; then
+                bash -ex ci/test-coverage.sh
+            else
+                bash -ex ci/build.sh
+                mv linuxdeploy*.AppImage* /artifacts
+            fi
 
-      - name: install dependencies (ubuntu only)
-        if: matrix.platform == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev webkit2gtk-4.0 libappindicator3-dev librsvg2-dev patchelf
-
-      # Install wasm-pack
-      - uses: jetli/wasm-pack-action@v0.3.0
+      - name: Upload
+        if: matrix.BUILD_TYPE != 'coverage'
+        uses: actions/upload-artifact@v2
         with:
-          # Optional version of wasm-pack to install(eg. 'v0.9.1', 'latest')
-          version: v0.9.1
+          name: container_artifacts
+          path: artifacts/linuxdeploy*.AppiImage*
 
-      - name: Install rsw
-        run: cargo install rsw
-
-      - name: Get yarn cache directory path
-        id: yarn-cache-dir-path
-        run: echo "::set-output name=dir::$(yarn config get cacheFolder)"
-
-      - name: Yarn cache
-        uses: actions/cache@v2
-        id: yarn-cache # use this to check for `cache-hit` (`steps.yarn-cache.outputs.cache-hit != 'true'`)
-        with:
-          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
-          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-yarn-
-
-      - name: Install app dependencies and build it
-        run: yarn && yarn build
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
-        with:
-          releaseId: ${{ needs.create-release.outputs.RELEASE_UPLOAD_ID }}
-
-  updater:
+  upload:
+    name: Create release and upload artifacts
+    needs: [build-and-test, container_build]
     runs-on: ubuntu-latest
-    needs: [create-release, build-tauri]
-
     steps:
-      - uses: actions/checkout@v2
-      - run: yarn
-      - run: yarn updater
+      - name: Download artifacts
+        uses: actions/download-artifact@v2
+      - name: Inspect directory after downloading artifacts
+        run: ls -alFR
+      - name: Create release and upload artifacts
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Deploy install.json
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./updater
-          force_orphan: true
+          GITHUB_TOKEN: ${{ secrets.DEPLOYTOKEN }}
+        run: |
+            wget -q https://github.com/TheAssassin/pyuploadtool/releases/download/continuous/pyuploadtool-x86_64.AppImage
+            chmod +x pyuploadtool-x86_64.AppImage
+            ./pyuploadtool-x86_64.AppImage **/linuxdeploy*.AppImage*
